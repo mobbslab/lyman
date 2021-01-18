@@ -1,9 +1,13 @@
 from __future__ import division
 import numpy as np
 import pandas as pd
+import os
 import scipy as sp
+from numba import njit
 from scipy import sparse, stats, signal, linalg
 from scipy.interpolate import interp1d
+import shutil
+from joblib import Parallel, delayed
 
 from .signals import smooth_volume
 from .utils import image_to_matrix, matrix_to_image
@@ -573,7 +577,74 @@ def default_tukey_window(n):
     return int(np.floor(np.sqrt(n)))
 
 
-def iterative_ols_fit(Y, X):
+
+@njit
+def _inner_ols_fit(X_i, y_i, Imat):
+
+    y_i = y_i.astype(np.float64)
+    X_i = X_i.astype(np.float64)
+
+    XtXinv_i = np.linalg.pinv(np.dot(X_i.T, X_i))
+    b_i = np.dot(XtXinv_i, np.dot(X_i.T, y_i))
+    R_i = Imat - np.dot(X_i, np.dot(XtXinv_i, X_i.T))
+    e_i = np.dot(R_i, y_i)
+    ss_i = np.dot(e_i, e_i.T) / np.trace(R_i)
+
+    return b_i, ss_i, XtXinv_i, e_i
+
+@njit
+def _inner_ols_fit_loop(Y, X):
+    """ Used for serial processing """
+    
+    n_tp, n_ev, n_vox = X.shape
+
+    B = np.empty((n_vox, n_ev), np.float64)
+    SS = np.empty(n_vox, np.float64)
+    XtXinv = np.empty((n_vox, n_ev, n_ev), np.float64)
+    E = np.empty((n_tp, n_vox), np.float64)
+
+    Imat = np.eye(n_tp)
+
+    for i in range(n_vox):
+
+        y_i, X_i = Y[..., i], X[..., i]
+
+        b_i, ss_i, XtXinv_i, e_i = _inner_ols_fit(X_i, y_i, Imat)
+
+        B[i] = b_i
+        SS[i] = ss_i
+        XtXinv[i] = XtXinv_i
+        E[:, i] = e_i
+
+    return B, SS, XtXinv, E
+
+# @njit
+def _inner_ols_fit_loop2(Y, X, B, SS, XtXinv, E, slices):
+    """ Used for parallel processing """
+
+    _, n_tp, _ = X.shape
+
+    Imat = np.eye(n_tp)
+
+    # Create temporary arrays - held in memory
+    temp_B = np.zeros_like(B[slices, ...])
+    temp_SS = np.zeros_like(SS[slices, ...])
+    temp_XtXinv = np.zeros_like(XtXinv[slices, ...])
+    temp_E = np.zeros_like(E[slices, :])
+
+    temp_X = np.zeros_like(X[slices, :])
+    temp_Y = np.zeros_like(Y[slices, :])
+    temp_X[:] = X[slices, ...]
+    temp_Y[:] = Y[slices, ...]
+
+    for i in range(len(slices)):
+        temp_B[i, ...], temp_SS[i, ...], temp_XtXinv[i, ...], temp_E[i, :] = _inner_ols_fit(temp_X[i, ...], temp_Y[i, ...], Imat)
+
+    # Write to actual memmaped array
+    B[slices, ...], SS[slices, ...], XtXinv[slices, ...], E[slices, :] = temp_B, temp_SS, temp_XtXinv, temp_E 
+
+
+def iterative_ols_fit(Y, X, n_jobs=1, temp_dir='.'):
     """Fit a linear model using ordinary least squares in each voxel.
 
     The design matrix is expected to be 3D because this function is intended
@@ -586,6 +657,8 @@ def iterative_ols_fit(Y, X):
         Time series for each voxel.
     X : n_tp x n_ev x n_vox array
         Design matrix for each voxel.
+    n_jobs: Number of parallel jobs to run
+    temp_dir: Location to store temporary files
 
     Returns
     -------
@@ -599,39 +672,56 @@ def iterative_ols_fit(Y, X):
         Residual time series at each voxel.
 
     """
-    from numpy import dot
-    from numpy.linalg import pinv
-
-    Y = Y.astype(np.float64)
-    X = X.astype(np.float64)
 
     assert Y.shape[0] == X.shape[0]
-    assert Y.shape[1] == X.shape[2]
 
-    n_tp, n_ev, n_vox = X.shape
+    if n_jobs == 1:
+        Y = Y.T
+        X = X.transpose(1, 2, 0)
+        B, SS, XtXinv, E = _inner_ols_fit_loop(Y, X)
 
-    B = np.empty((n_vox, n_ev), np.float32)
-    SS = np.empty(n_vox, np.float32)
-    XtXinv = np.empty((n_vox, n_ev, n_ev), np.float32)
-    E = np.empty((n_tp, n_vox), np.float32)
+        return B, SS, XtXinv, E
 
-    Imat = np.eye(n_tp)
+    else:
 
-    for i in range(n_vox):
+        # Memmpaing
+        folder = temp_dir
+        try:
+            os.makedirs(folder)
+        except FileExistsError:
+            pass
+        
+        # n_tp, n_ev, n_vox = X.shape
+        n_vox, n_tp, n_ev = X.shape
+        
+        slices = np.array_split(np.arange(X.shape[0]).astype(int), n_jobs)
+        
+        # Set up output memmaps using numpy functions
+        B2_filename_memmap = os.path.join(folder, 'B2_memmap')
+        SS2_filename_memmap = os.path.join(folder, 'SS2_memmap')
+        XtXinv2_filename_memmap = os.path.join(folder, 'XtXinv2_memmap')
+        E2_filename_memmap = os.path.join(folder, 'E2_memmap')
+        B2 = np.memmap(B2_filename_memmap, dtype=np.float64,
+                   shape=(n_vox, n_ev), mode='w+')
+        SS2 = np.memmap(SS2_filename_memmap, dtype=np.float64,
+                   shape=n_vox, mode='w+')
+        XtXinv2 = np.memmap(XtXinv2_filename_memmap, dtype=np.float64,
+                   shape=(n_vox, n_ev, n_ev), mode='w+')
+        E2 = np.memmap(E2_filename_memmap, dtype=np.float64,
+                   shape=(n_vox, n_tp), mode='w+')
 
-        y_i, X_i = Y[..., i], X[..., i]
-        XtXinv_i = pinv(dot(X_i.T, X_i))
-        b_i = dot(XtXinv_i, dot(X_i.T, y_i))
-        R_i = Imat - dot(X_i, dot(XtXinv_i, X_i.T))
-        e_i = dot(R_i, y_i)
-        ss_i = dot(e_i, e_i.T) / R_i.trace()
+        # Run
+        outs = Parallel(n_jobs=n_jobs, backend='loky')(delayed(_inner_ols_fit_loop2)(Y, X, B2, SS2, XtXinv2, E2, n) for n in slices)
+        E2 = E2.T  # Put this back in the right shape
 
-        B[i] = b_i
-        SS[i] = ss_i
-        XtXinv[i] = XtXinv_i
-        E[:, i] = e_i
+        
 
-    return B, SS, XtXinv, E
+        try:
+            shutil.rmtree(folder)
+        except: 
+            print('Could not clean-up automatically.')
+
+        return B2, SS2, XtXinv2, E2
 
 
 def iterative_contrast_estimation(B, SS, XtXinv, C):
